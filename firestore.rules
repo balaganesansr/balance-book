@@ -1,0 +1,250 @@
+rules_version = '2';
+
+// Balance Book: Cloud Firestore security rules.
+//
+// The data model is what makes these rules simple: everything a user owns
+// lives under their own `users/{uid}` document, so ownership is decided by
+// comparing one path segment against the authenticated uid. There is no path
+// through which one signed-in user can reach another's clients or transactions.
+//
+//   users/{uid}
+//   users/{uid}/clients/{clientId}
+//   users/{uid}/clients/{clientId}/projects/{projectId}
+//   users/{uid}/clients/{clientId}/transactions/{transactionId}
+//
+// Beyond ownership, these rules validate the shape of financial data: amounts
+// must be integers (minor units, paise), the signed `delta` must match the
+// `amount` it came from, timestamps must be server-assigned, and a recorded
+// transaction's amount, type and running balance can never be edited.
+//
+// What rules deliberately do NOT enforce: that a client's `currentBalance`
+// equals the sum of its transactions. Firestore rules cannot express a
+// cross-document invariant like that. It is guaranteed instead by every
+// balance-changing write running inside a Firestore transaction that reads the
+// client document first. See `lib/services/transaction_service.dart`.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- helpers
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Server timestamps resolve to request.time, so this both proves the value
+    // was written with FieldValue.serverTimestamp() and blocks back-dating.
+    function isServerTime(field) {
+      return incoming()[field] == request.time;
+    }
+
+    function changedKeys() {
+      return incoming().diff(existing()).affectedKeys();
+    }
+
+    function unchanged(field) {
+      return !(field in changedKeys()) || incoming()[field] == existing()[field];
+    }
+
+    function isNonEmptyString(value, maxLength) {
+      return value is string && value.size() > 0 && value.size() <= maxLength;
+    }
+
+    function isBoundedString(value, maxLength) {
+      return value is string && value.size() <= maxLength;
+    }
+
+    // ------------------------------------------------------------------ user
+
+    function validProfile() {
+      return isBoundedString(incoming().name, 120)
+          && isBoundedString(incoming().email, 320)
+          && isBoundedString(incoming().currency, 8)
+          && isBoundedString(incoming().paymentDetails, 1000);
+    }
+
+    match /users/{uid} {
+      allow get, list: if isOwner(uid);
+      allow create: if isOwner(uid) && validProfile() && isServerTime('createdAt');
+      allow update: if isOwner(uid) && validProfile() && isServerTime('updatedAt');
+
+      // Deleting the profile document would orphan every client beneath it.
+      // Account removal belongs in an admin flow, not a client-side delete.
+      allow delete: if false;
+
+      // --------------------------------------------------------------- client
+
+      function validClientShape() {
+        return isNonEmptyString(incoming().name, 120)
+            && isBoundedString(incoming().companyName, 160)
+            && isBoundedString(incoming().phone, 40)
+            && isBoundedString(incoming().email, 320)
+            && isBoundedString(incoming().address, 500)
+            && isBoundedString(incoming().notes, 2000)
+            && isBoundedString(incoming().avatarColor, 16)
+            // Money is always an integer count of minor units. A float here
+            // would be the start of every rounding bug this app avoids.
+            && incoming().currentBalance is int
+            && incoming().totalCharged is int
+            && incoming().totalPaid is int
+            && incoming().totalCharged >= 0
+            && incoming().totalPaid >= 0
+            && incoming().transactionCount is int
+            && incoming().transactionCount >= 0
+            && incoming().isFavorite is bool
+            && incoming().status in ['active', 'inactive', 'archived'];
+      }
+
+      match /clients/{clientId} {
+        allow get, list: if isOwner(uid);
+
+        allow create: if isOwner(uid)
+                      && validClientShape()
+                      && isServerTime('createdAt');
+
+        allow update: if isOwner(uid)
+                      && validClientShape()
+                      && isServerTime('updatedAt')
+                      && unchanged('createdAt');
+
+        allow delete: if isOwner(uid);
+
+        // ------------------------------------------------------------ project
+
+        match /projects/{projectId} {
+          allow get, list, delete: if isOwner(uid);
+
+          allow create, update: if isOwner(uid)
+                                && isNonEmptyString(incoming().name, 120)
+                                && isBoundedString(incoming().note, 1000)
+                                && isBoundedString(incoming().color, 16)
+                                && incoming().status in ['active', 'completed', 'archived']
+                                && isServerTime('updatedAt');
+        }
+
+        // -------------------------------------------------------- transaction
+
+        function validTransactionCreate() {
+          return incoming().userId == uid
+              && incoming().clientId == clientId
+              && incoming().type in ['opening', 'charge', 'payment', 'adjustment', 'reversal']
+              // Integer minor units only, and never a negative headline amount:
+              // direction is carried by `delta`, not by the sign of `amount`.
+              && incoming().amount is int
+              && incoming().amount >= 0
+              && incoming().delta is int
+              && incoming().runningBalance is int
+              // The signed effect must be the amount, one way or the other.
+              // Rules have no abs(), so both directions are spelled out.
+              && (incoming().delta == incoming().amount
+                  || incoming().delta == -incoming().amount)
+              && isBoundedString(incoming().note, 500)
+              && isBoundedString(incoming().paymentMethod, 60)
+              && incoming().createdBy == uid
+              && incoming().isReversed == false
+              && isServerTime('createdAt');
+        }
+
+        // Only descriptive fields and the reversal bookkeeping may ever change.
+        // The amount, the type, the signed delta and the running balance are
+        // immutable once written. Editing any of them would silently
+        // invalidate every balance recorded afterwards.
+        function validTransactionUpdate() {
+          return changedKeys().hasOnly([
+                   'note', 'paymentMethod', 'projectId',
+                   'editedAt', 'isReversed', 'reversedById'
+                 ])
+              && unchanged('userId')
+              && unchanged('clientId')
+              && unchanged('type')
+              && unchanged('amount')
+              && unchanged('delta')
+              && unchanged('runningBalance')
+              && unchanged('prevTransactionId')
+              && unchanged('reversesId')
+              && unchanged('createdAt')
+              && unchanged('createdBy')
+              && isBoundedString(incoming().note, 500)
+              && isBoundedString(incoming().paymentMethod, 60);
+        }
+
+        match /transactions/{transactionId} {
+          allow get, list: if isOwner(uid);
+          allow create: if isOwner(uid) && validTransactionCreate();
+          allow update: if isOwner(uid) && validTransactionUpdate();
+
+          // Permitted so the app can remove the newest entry as an undo. The
+          // "must still be the newest" check cannot be expressed here, so it is
+          // enforced atomically inside the Firestore transaction that performs
+          // the delete, against the client's `lastTransactionId`.
+          allow delete: if isOwner(uid);
+        }
+      }
+    }
+
+    // -------------------------------------------------- public balance pages
+    //
+    // The one place an unauthenticated reader is allowed, and the boundary is
+    // deliberately narrow:
+    //
+    //  * `get` is open, so a client holding their link can read their page.
+    //  * `list` is DENIED. Without it the collection cannot be enumerated, so
+    //    nobody can walk it to discover other clients' links. This single line
+    //    is what turns "public collection" into "capability URL".
+    //  * Document ids are 24 random characters (~139 bits) generated with a
+    //    CSPRNG, so they cannot be guessed or brute forced either.
+    //  * Only the owner may create, overwrite or delete a snapshot, proven by
+    //    the `userId` field on the document.
+    //
+    // These documents are mirrors, written by the app. Nothing under
+    // `users/{uid}` becomes readable because of them, and the snapshot itself
+    // carries no phone, email, address or private notes. See
+    // `PortalService.buildSnapshot`, which is an explicit allow-list.
+
+    match /publicLedgers/{shareId} {
+      allow get: if true;
+      allow list: if false;
+
+      allow create: if isSignedIn()
+                    && incoming().userId == request.auth.uid
+                    && incoming().currentBalance is int
+                    && isBoundedString(incoming().clientName, 120)
+                    && isServerTime('updatedAt');
+
+      allow update: if isSignedIn()
+                    && existing().userId == request.auth.uid
+                    && incoming().userId == request.auth.uid
+                    && incoming().currentBalance is int
+                    && isServerTime('updatedAt');
+
+      allow delete: if isSignedIn() && existing().userId == request.auth.uid;
+    }
+
+    // ------------------------------------------------ collection group access
+    //
+    // The Activity screen and the period reports read every transaction the
+    // user owns in one collection-group query. That query is evaluated against
+    // this rule rather than the nested one above, so it needs its own entry.
+    //
+    // Read-only, and scoped by the `userId` stamped on every transaction, so a
+    // query without `where('userId', isEqualTo: <own uid>)` is rejected.
+
+    match /{path=**}/transactions/{transactionId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // Anything not matched above is denied by default.
+  }
+}
